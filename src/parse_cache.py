@@ -101,7 +101,17 @@ class ParseProgressTracker:
         except Exception:
             pass
 
-    def _heartbeat(self, phase: str, *, pages_processed: Optional[int] = None, pages_total: Optional[int] = None, figures_described: Optional[int] = None, figures_total: Optional[int] = None) -> None:
+    def _heartbeat(
+        self,
+        phase: str,
+        *,
+        pages_processed: Optional[int] = None,
+        pages_total: Optional[int] = None,
+        figures_described: Optional[int] = None,
+        figures_total: Optional[int] = None,
+        batch_index: Optional[int] = None,
+        batches_total: Optional[int] = None,
+    ) -> None:
         now = time.time()
         if (now - self._last_heartbeat_ts) < 1.0 and not phase == "final":
             # Avoid writing dozens of updates per second
@@ -118,6 +128,10 @@ class ParseProgressTracker:
             heartbeat["figures_described"] = figures_described
         if figures_total is not None:
             heartbeat["figures_total"] = figures_total
+        if batch_index is not None:
+            heartbeat["batch_index"] = batch_index
+        if batches_total is not None:
+            heartbeat["batches_total"] = batches_total
         self._data["heartbeat"] = heartbeat
         self._last_heartbeat_ts = now
         if self.progress_callback:
@@ -173,6 +187,8 @@ class ParseProgressTracker:
         next_page: Optional[int] = None,
         pages_processed: Optional[int] = None,
         pages_total: Optional[int] = None,
+        batch_index: Optional[int] = None,
+        batches_total: Optional[int] = None,
     ) -> None:
         metadata_copy = copy.deepcopy(metadata)
         if pages_total is None:
@@ -191,6 +207,10 @@ class ParseProgressTracker:
         }
         if next_page is not None:
             doc["next_page"] = next_page
+        if batch_index is not None:
+            doc["batch_index"] = batch_index
+        if batches_total is not None:
+            doc["batches_total"] = batches_total
         self._data["doc"] = doc
         self._next_page_log = self.page_checkpoint
         self._next_fig_log = self.FIGURE_CHECKPOINT
@@ -200,6 +220,8 @@ class ParseProgressTracker:
             pages_total=pages_total,
             figures_described=described_count,
             figures_total=len(figures),
+            batch_index=batch_index,
+            batches_total=batches_total,
         )
         self._maybe_flush(force=True)
 
@@ -218,6 +240,8 @@ class ParseProgressTracker:
         total = self.total_figures()
         pages_total = doc.get("pages_total")
         next_page = doc.get("next_page")
+        batch_index = doc.get("batch_index")
+        batches_total = doc.get("batches_total")
         if isinstance(pages_total, int):
             if isinstance(next_page, int):
                 pages_processed = min(max(next_page - 1, 0), pages_total)
@@ -245,6 +269,8 @@ class ParseProgressTracker:
             pages_total=pages_total if isinstance(pages_total, int) else None,
             figures_described=described,
             figures_total=total,
+            batch_index=batch_index if isinstance(batch_index, int) else None,
+            batches_total=batches_total if isinstance(batches_total, int) else None,
         )
 
     def log_doc_progress(self, pages_processed: int, pages_total: Optional[int]) -> None:
@@ -264,6 +290,8 @@ class ParseProgressTracker:
         pages_total: Optional[int] = None,
         figures_described: Optional[int] = None,
         figures_total: Optional[int] = None,
+        batch_index: Optional[int] = None,
+        batches_total: Optional[int] = None,
     ) -> None:
         snapshot = {
             "phase": phase,
@@ -271,6 +299,8 @@ class ParseProgressTracker:
             "pages_total": pages_total,
             "figures_described": figures_described,
             "figures_total": figures_total,
+            "batch_index": batch_index,
+            "batches_total": batches_total,
         }
         if snapshot != self._last_phase_snapshot:
             parts = [f"phase={phase}"]
@@ -280,6 +310,9 @@ class ParseProgressTracker:
             if figures_described is not None:
                 fig_total = figures_total if figures_total is not None else "?"
                 parts.append(f"figures={figures_described}/{fig_total}")
+            if batch_index is not None:
+                batch_total_str = str(batches_total) if batches_total is not None else "?"
+                parts.append(f"batch={batch_index}/{batch_total_str}")
             self.log.info("Parse heartbeat: " + " ".join(parts))
             self._last_phase_snapshot = snapshot
         self._heartbeat(
@@ -288,6 +321,8 @@ class ParseProgressTracker:
             pages_total=pages_total,
             figures_described=figures_described,
             figures_total=figures_total,
+            batch_index=batch_index,
+            batches_total=batches_total,
         )
 
     def total_figures(self) -> int:
@@ -325,7 +360,26 @@ class ParseProgressTracker:
                 f"Parse progress: figures={described}/{len(figures)}"
             )
             self._next_fig_log = described + self.FIGURE_CHECKPOINT
-        self._heartbeat("figures", figures_described=described, figures_total=len(figures))
+        pages_total = doc.get("pages_total")
+        next_page = doc.get("next_page")
+        if isinstance(pages_total, int):
+            if isinstance(next_page, int):
+                pages_processed = min(max(next_page - 1, 0), pages_total)
+            else:
+                pages_processed = pages_total
+        else:
+            pages_processed = None
+        batch_index = doc.get("batch_index")
+        batches_total = doc.get("batches_total")
+        self._heartbeat(
+            "figures",
+            pages_processed=pages_processed,
+            pages_total=pages_total if isinstance(pages_total, int) else None,
+            figures_described=described,
+            figures_total=len(figures),
+            batch_index=batch_index if isinstance(batch_index, int) else None,
+            batches_total=batches_total if isinstance(batches_total, int) else None,
+        )
         self._maybe_flush()
 
     def finalize(self, markdown: str, metadata: Dict[str, Any]) -> None:
@@ -339,5 +393,17 @@ class ParseProgressTracker:
                 figures = doc.get("figures")
                 if isinstance(figures, list):
                     described = sum(1 for entry in figures if isinstance(entry, dict) and entry.get("completed") is True)
-        self._heartbeat("final", figures_described=described, figures_total=figures_total)
+        pages_total = metadata.get("page_count") or (doc.get("pages_total") if isinstance(doc, dict) else None)
+        pages_processed = pages_total if isinstance(pages_total, int) else None
+        batch_index = doc.get("batch_index") if isinstance(doc, dict) else None
+        batches_total = doc.get("batches_total") if isinstance(doc, dict) else None
+        self._heartbeat(
+            "final",
+            pages_processed=pages_processed,
+            pages_total=pages_total if isinstance(pages_total, int) else None,
+            figures_described=described,
+            figures_total=figures_total,
+            batch_index=batch_index if isinstance(batch_index, int) else None,
+            batches_total=batches_total if isinstance(batches_total, int) else None,
+        )
         self._maybe_flush(force=True)

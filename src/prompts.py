@@ -194,4 +194,10 @@ def default_prompt() -> str:
 
 def ocr_prompt() -> str:
     """Prompt helper for OCR-style transcription."""
-    return "Transkripsikan seluruh teks pada halaman secara lengkap dengan format Markdown."
+    return build_ocr_instruction(
+        task=(
+            "Transkripsikan seluruh teks pada halaman secara lengkap. "
+            "Abaikan kop surat, logo, header, footer, nomor halaman, dan watermark; "
+            "fokus hanya pada isi utama dokumen dan salin apa adanya dalam Markdown."
+        )
+    )

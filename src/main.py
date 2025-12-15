@@ -20,7 +20,7 @@ import os
 import click
 from dotenv import load_dotenv
 
-from .pipeline_sync import process_file
+from .pipeline import process_file
 
 
 @click.command()

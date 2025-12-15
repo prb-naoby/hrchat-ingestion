@@ -1,0 +1,50 @@
+version: "3.8"
+
+services:
+  hrchat-ingestion:
+    image: ghcr.io/prb-naoby/hrchat-ingestion:latest
+    container_name: hrchat-ingestion
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - QDRANT_API_KEY=${QDRANT_API_KEY}
+      - QDRANT_URL=${QDRANT_URL}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION}
+      - GEMINI_MODEL=${GEMINI_MODEL}
+      - BM25_MODEL=${BM25_MODEL}
+      - DENSE_EMBEDDING_MODEL=${DENSE_EMBEDDING_MODEL}
+      - BM25_API_KEY=${BM25_API_KEY}
+      - IMG_MAX_SIDE=${IMG_MAX_SIDE}
+      - VLM_MAX_TOKENS=${VLM_MAX_TOKENS}
+      - VLM_TEMPERATURE=${VLM_TEMPERATURE}
+      - IMG_JPEG_QUALITY=${IMG_JPEG_QUALITY}
+      - RETRY_MAX=${RETRY_MAX}
+      - RETRY_BASE_SEC=${RETRY_BASE_SEC}
+      - BM25_CACHE_DIR=/app/data/.cache_fastembed
+      - EMBED_BATCH_SIZE=${EMBED_BATCH_SIZE}
+      - MAX_WORKERS=${MAX_WORKERS}
+      - INGEST_QUEUE_DIR=/app/data/ingest_queue
+      - LOG_FILE=/app/data/logs/ingestion.log
+    volumes:
+      - hrchat_data:/app/data
+    networks:
+      - n8n
+      - qdrant
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/healthz" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  hrchat_data:
+    name: hrchat_data
+
+networks:
+  n8n:
+    external: true
+  qdrant:
+    external: true

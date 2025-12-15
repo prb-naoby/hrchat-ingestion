@@ -1,4 +1,4 @@
-﻿"""Parsing and figure description utilities.
+"""Parsing and figure description utilities.
 
 This module wraps the heavy docling parsing functionality in a synchronous API
 and adds concurrency around calls to the Gemini visual language model
@@ -12,6 +12,7 @@ or :func:`_parse_image`.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import time
@@ -40,8 +41,8 @@ OCR_MIN_LINES_PER_PAGE = int(os.getenv("OCR_MIN_LINES_PER_PAGE", "3"))
 OCR_RENDER_DPI = int(os.getenv("OCR_RENDER_DPI", "220"))
 OCR_RENDER_MAX_PAGES = int(os.getenv("OCR_RENDER_MAX_PAGES", "500"))
 VLM_FIGURE_TIMEOUT = float(os.getenv("VLM_FIGURE_TIMEOUT_SEC", "60"))
-OCR_RENDER_DPI = int(os.getenv("OCR_RENDER_DPI", "220"))
 PARSE_PAGE_BATCH_SIZE = max(1, int(os.getenv("PARSE_PAGE_BATCH_SIZE", "50")))
+PARSE_PAGE_BATCH_PERCENT = float(os.getenv("PARSE_PAGE_BATCH_PERCENT", "5"))
 
 
 def _pdf_page_count(path: str) -> Optional[int]:
@@ -55,7 +56,7 @@ def _pdf_page_count(path: str) -> Optional[int]:
 
 
 def _ensure_primitive(value: Any) -> Any:
-    """Coerce arbitrary objects into JSON‑serialisable primitives.
+    """Coerce arbitrary objects into JSON-serialisable primitives.
 
     If the value is callable it will be invoked (best effort).  Containers are
     traversed recursively.  Unserialisable objects are converted to strings.
@@ -147,7 +148,7 @@ def clean_markdown(md: str) -> str:
 def _describe_one(vlm: GeminiVLM, f: Figure, prompt: str, job_key: str, filename: str) -> FigureDesc:
     """Describe a single figure with retries.
 
-    Small images (less than ~5 kB) are assumed to be logos or decorative
+    Small images (less than ~5?kB) are assumed to be logos or decorative
     elements and skipped.  Descriptions shorter than ten characters are
     retried up to three times.  Any exceptions are caught and logged.
     """
@@ -355,12 +356,18 @@ def _parse_pdf(
     parser = DocParser(keep_page_images=True)
     total_pages = _pdf_page_count(tmp_path)
     batch_size = PARSE_PAGE_BATCH_SIZE
+    total_batches: Optional[int] = None
+    overall_start = time.perf_counter()
 
     aggregated_base_md = ""
     aggregated_figures: List[Figure] = []
     aggregated_page_images: List[Tuple[int, bytes]] = []
     doc_loaded_from_cache = False
     next_page = 1
+    image_only_doc = False
+    aggregated_descs: Dict[int, FigureDesc] = {}
+    existing_fig_descs: Dict[int, str] = cache_tracker.existing_descriptions() if cache_tracker else {}
+    prompt = default_prompt()
 
     if cache_tracker and cache_tracker.doc_ready():
         doc_state = cache_tracker.get_doc_state()
@@ -396,6 +403,14 @@ def _parse_pdf(
                         jpeg_bytes=jpeg_bytes,
                     )
                 )
+                if figure_state.description:
+                    aggregated_descs[figure_state.index] = FigureDesc(
+                        index=figure_state.index,
+                        page=figure_state.page if isinstance(figure_state.page, int) else None,
+                        caption=figure_state.caption,
+                        description=figure_state.description,
+                    )
+                    existing_fig_descs.pop(figure_state.index, None)
             stored_pages_total = doc_state.get("pages_total")
             if isinstance(stored_pages_total, int):
                 total_pages = stored_pages_total
@@ -410,21 +425,53 @@ def _parse_pdf(
         cache_tracker.resume()
         if isinstance(total_pages, int) and next_page > total_pages:
             doc_loaded_from_cache = True
+    if isinstance(total_pages, int) and total_pages > 0:
+        percent_batch = int(math.ceil(total_pages * max(PARSE_PAGE_BATCH_PERCENT, 0.0) / 100.0))
+        candidates = [PARSE_PAGE_BATCH_SIZE]
+        if percent_batch > 0:
+            candidates.append(percent_batch)
+        batch_size = max(1, min([total_pages] + candidates))
     else:
-        if cache_tracker:
-            cache_tracker.update_phase(
-                "docling",
-                pages_processed=0,
-                pages_total=total_pages,
-                figures_total=0,
-            )
+        batch_size = PARSE_PAGE_BATCH_SIZE
+    total_batches = (
+        math.ceil(total_pages / batch_size) if isinstance(total_pages, int) and total_pages > 0 else None
+    )
+
+    if cache_tracker:
+        if isinstance(total_pages, int):
+            if isinstance(next_page, int):
+                pages_processed_seed = min(max(next_page - 1, 0), total_pages)
+            else:
+                pages_processed_seed = 0
+        else:
+            pages_processed_seed = None
+        if total_batches and total_batches > 0 and isinstance(next_page, int) and isinstance(total_pages, int):
+            batch_index_seed = min(total_batches, max(0, (max(next_page, 1) - 1) // batch_size))
+        elif total_batches:
+            batch_index_seed = 0
+        else:
+            batch_index_seed = None
+        cache_tracker.update_phase(
+            "docling",
+            pages_processed=pages_processed_seed,
+            pages_total=total_pages,
+            figures_total=len(aggregated_figures),
+            batch_index=batch_index_seed,
+            batches_total=total_batches,
+        )
 
     if not doc_loaded_from_cache:
         if isinstance(total_pages, int) and total_pages > batch_size:
             start_page = max(next_page, 1)
             figure_counter = aggregated_figures[-1].index + 1 if aggregated_figures else 1
+            effective_total_batches = total_batches or max(1, math.ceil(total_pages / batch_size))
+            completed_batches = max(0, (start_page - 1) // batch_size)
+            batch_index = completed_batches + 1 if start_page <= total_pages else completed_batches
             if start_page <= 1 and not aggregated_base_md:
-                log.info("Doc parser: starting Docling conversion (batched)")
+                log.info(
+                    f"Doc parser: starting Docling conversion (batched) "
+                    f"batch_size={batch_size} total_batches={effective_total_batches}"
+                )
             while start_page <= total_pages:
                 end_page = min(start_page + batch_size - 1, total_pages)
                 t_doc = time.perf_counter()
@@ -432,9 +479,22 @@ def _parse_pdf(
                     tmp_path, page_range=(start_page, end_page)
                 )
                 doc_seconds = time.perf_counter() - t_doc
+                overall_elapsed = time.perf_counter() - overall_start
+                percent_complete = (end_page / total_pages) * 100 if total_pages else None
+                batch_label = (
+                    f"{batch_index}/{effective_total_batches}"
+                    if effective_total_batches
+                    else str(batch_index)
+                )
+                progress_text = (
+                    f" progress={percent_complete:.1f}%"
+                    if percent_complete is not None
+                    else ""
+                )
                 log.info(
-                    f"Doc parser: converted pages {start_page}-{end_page} "
-                    f"in {doc_seconds:.2f}s (figures_detected={len(chunk_figures)})"
+                    f"Doc parser: batch {batch_label} pages {start_page}-{end_page} "
+                    f"took={doc_seconds:.2f}s elapsed_total={overall_elapsed:.2f}s "
+                    f"(figures_detected={len(chunk_figures)}){progress_text}"
                 )
                 if not metadata.get("page_count"):
                     meta_extra = extract_metadata_from_doc(doc)
@@ -448,33 +508,96 @@ def _parse_pdf(
                         else chunk_text
                     )
                 chunk_length = end_page - start_page + 1
+                is_first_batch = batch_index == 1
+                has_text = bool(chunk_text)
+                all_pages_have_images = len(chunk_page_images) >= chunk_length
+                if (
+                    is_first_batch
+                    and not has_text
+                    and all_pages_have_images
+                    and not doc_loaded_from_cache
+                ):
+                    log.info(
+                        "Doc parser: detected image-only document after first batch; switching to OCR pipeline"
+                    )
+                    image_only_doc = True
+                    total_batches = effective_total_batches
+                    aggregated_base_md = ""
+                    aggregated_figures.clear()
+                    aggregated_page_images = list(chunk_page_images)
+                    if cache_tracker:
+                        cache_tracker.update_phase(
+                            "ocr",
+                            pages_processed=end_page,
+                            pages_total=total_pages,
+                            figures_described=0,
+                            figures_total=0,
+                            batch_index=batch_index,
+                            batches_total=effective_total_batches,
+                        )
+                    break
+                batch_added_figs: List[Figure] = []
+                new_valid_figs: List[Figure] = []
                 for fig in chunk_figures:
                     page_no = fig.page
                     if page_no is not None and start_page > 1 and page_no <= chunk_length:
                         page_no += start_page - 1
-                    aggregated_figures.append(
-                        Figure(
-                            index=figure_counter,
-                            page=page_no,
-                            caption=fig.caption,
-                            jpeg_bytes=fig.jpeg_bytes,
-                        )
+                    figure = Figure(
+                        index=figure_counter,
+                        page=page_no,
+                        caption=fig.caption,
+                        jpeg_bytes=fig.jpeg_bytes,
                     )
+                    aggregated_figures.append(figure)
+                    batch_added_figs.append(figure)
+                    if len(figure.jpeg_bytes) >= 5000:
+                        if figure.index in aggregated_descs:
+                            pass
+                        elif figure.index in existing_fig_descs:
+                            desc_text = existing_fig_descs.pop(figure.index)
+                            desc_obj = FigureDesc(
+                                index=figure.index,
+                                page=figure.page,
+                                caption=figure.caption,
+                                description=desc_text,
+                            )
+                            aggregated_descs[figure.index] = desc_obj
+                            if cache_tracker:
+                                cache_tracker.record_description(figure.index, desc_text)
+                        else:
+                            new_valid_figs.append(figure)
                     figure_counter += 1
+                if new_valid_figs:
+                    try:
+                        descs = _describe_figures(
+                            new_valid_figs,
+                            prompt,
+                            job_key,
+                            filename,
+                            cache_tracker=cache_tracker,
+                        )
+                        for desc in descs:
+                            aggregated_descs[desc.index] = desc
+                            if cache_tracker:
+                                cache_tracker.record_description(desc.index, desc.description or "")
+                    except Exception as exc:
+                        log.warning(f"Doc parser: figure description failed for batch {batch_index}: {exc}")
                 for page_no, img_bytes in chunk_page_images:
                     if start_page > 1 and page_no <= chunk_length:
                         page_no += start_page - 1
                     aggregated_page_images.append((page_no, img_bytes))
                 if cache_tracker:
-                    figure_states = [
-                        FigureState.from_bytes(f.index, f.page, f.caption, f.jpeg_bytes)
-                        for f in aggregated_figures
-                    ]
                     cache_metadata = dict(metadata)
                     cache_metadata["page_count"] = total_pages
-                    next_chunk_page = (
-                        end_page + 1 if end_page < total_pages else total_pages + 1
-                    )
+                    next_chunk_page = end_page + 1 if end_page < total_pages else total_pages + 1
+                    figure_states: List[FigureState] = []
+                    for fig in aggregated_figures:
+                        state = FigureState.from_bytes(fig.index, fig.page, fig.caption, fig.jpeg_bytes)
+                        desc_obj = aggregated_descs.get(fig.index)
+                        if desc_obj and desc_obj.description:
+                            state.description = desc_obj.description
+                            state.completed = True
+                        figure_states.append(state)
                     cache_tracker.store_doc_output(
                         base_markdown=aggregated_base_md,
                         metadata=cache_metadata,
@@ -482,28 +605,72 @@ def _parse_pdf(
                         next_page=next_chunk_page,
                         pages_processed=end_page,
                         pages_total=total_pages,
+                        batch_index=batch_index,
+                        batches_total=effective_total_batches,
                     )
                 start_page = end_page + 1
+                batch_index += 1
+            total_batches = effective_total_batches
         else:
             log.info("Doc parser: starting Docling conversion")
             t_doc = time.perf_counter()
             doc, chunk_md, chunk_figures, chunk_page_images = parser.parse(tmp_path)
             doc_seconds = time.perf_counter() - t_doc
+            overall_elapsed = time.perf_counter() - overall_start
             log.info(
                 f"Doc parser: conversion finished in {doc_seconds:.2f}s "
-                f"(figures_detected={len(chunk_figures)})"
+                f"(figures_detected={len(chunk_figures)}) elapsed_total={overall_elapsed:.2f}s"
             )
             meta_extra = extract_metadata_from_doc(doc)
             metadata.update(meta_extra)
             aggregated_base_md = chunk_md
-            aggregated_figures = chunk_figures
-            aggregated_page_images = chunk_page_images
+            aggregated_figures = []
+            aggregated_page_images = list(chunk_page_images)
+            figure_counter = 1
+            new_valid_figs: List[Figure] = []
+            for fig in chunk_figures:
+                figure = Figure(
+                    index=figure_counter,
+                    page=fig.page,
+                    caption=fig.caption,
+                    jpeg_bytes=fig.jpeg_bytes,
+                )
+                aggregated_figures.append(figure)
+                if len(figure.jpeg_bytes) >= 5000:
+                    if figure.index in aggregated_descs:
+                        pass
+                    elif figure.index in existing_fig_descs:
+                        desc_text = existing_fig_descs.pop(figure.index)
+                        desc_obj = FigureDesc(
+                            index=figure.index,
+                            page=figure.page,
+                            caption=figure.caption,
+                            description=desc_text,
+                        )
+                        aggregated_descs[figure.index] = desc_obj
+                        if cache_tracker:
+                            cache_tracker.record_description(figure.index, desc_text)
+                    else:
+                        new_valid_figs.append(figure)
+                figure_counter += 1
+            if new_valid_figs:
+                try:
+                    descs = _describe_figures(
+                        new_valid_figs,
+                        prompt,
+                        job_key,
+                        filename,
+                        cache_tracker=cache_tracker,
+                    )
+                    for desc in descs:
+                        aggregated_descs[desc.index] = desc
+                        if cache_tracker:
+                            cache_tracker.record_description(desc.index, desc.description or "")
+                except Exception as exc:
+                    log.warning(f"Doc parser: figure description failed: {exc}")
             total_pages = total_pages or metadata.get("page_count")
+            total_batches = 1 if isinstance(total_pages, int) and total_pages and total_pages > 0 else 1
             if cache_tracker:
-                figure_states = [
-                    FigureState.from_bytes(f.index, f.page, f.caption, f.jpeg_bytes)
-                    for f in aggregated_figures
-                ]
                 cache_metadata = dict(metadata)
                 cache_metadata["page_count"] = total_pages
                 next_chunk_page = (
@@ -511,6 +678,14 @@ def _parse_pdf(
                     if isinstance(total_pages, int)
                     else len(aggregated_page_images) + 1
                 )
+                figure_states: List[FigureState] = []
+                for fig in aggregated_figures:
+                    state = FigureState.from_bytes(fig.index, fig.page, fig.caption, fig.jpeg_bytes)
+                    desc_obj = aggregated_descs.get(fig.index)
+                    if desc_obj and desc_obj.description:
+                        state.description = desc_obj.description
+                        state.completed = True
+                    figure_states.append(state)
                 cache_tracker.store_doc_output(
                     base_markdown=aggregated_base_md,
                     metadata=cache_metadata,
@@ -518,11 +693,12 @@ def _parse_pdf(
                     next_page=next_chunk_page,
                     pages_processed=total_pages if isinstance(total_pages, int) else None,
                     pages_total=total_pages if isinstance(total_pages, int) else None,
+                    batch_index=1,
+                    batches_total=total_batches,
                 )
 
     base_md = aggregated_base_md
     figures = aggregated_figures
-    page_images = aggregated_page_images
 
     if total_pages is not None:
         metadata["page_count"] = total_pages
@@ -537,37 +713,57 @@ def _parse_pdf(
         "Doc parser: file stats "
         f"size_bytes={file_size} pages={metadata.get('page_count')} expected_chunks=unknown"
     )
-    # Filter out tiny figures before description
-    valid_figs = [f for f in figures if len(f.jpeg_bytes) >= 5000]
-    metadata["images_count"] = len(valid_figs)
-    metadata["page_images_available"] = len(page_images)
-    log.info(
-        f"Doc parser: retained {len(valid_figs)} valid figures (>=5KB) from {len(figures)} total"
-    )
-    prompt = default_prompt()
-    if valid_figs:
-        log.info("Doc parser: describing figures with Gemini VLM")
-    t_desc = time.perf_counter()
-    existing_descs = cache_tracker.existing_descriptions() if cache_tracker else {}
-    described_from_cache = 0
-    pending_figs: List[Figure] = []
-    cached_descs: List[FigureDesc] = []
-    if existing_descs:
-        for fig in valid_figs:
-            value = existing_descs.get(fig.index)
-            if value is not None:
-                cached_descs.append(
-                    FigureDesc(index=fig.index, page=fig.page, caption=fig.caption, description=value)
-                )
-                described_from_cache += 1
-            else:
-                pending_figs.append(fig)
-        if described_from_cache:
-            log.info(
-                f"Doc parser: reused {described_from_cache} cached figure descriptions"
+    if image_only_doc:
+        log.info("Doc parser: running OCR-only pipeline")
+        pages_for_ocr: List[Tuple[int, bytes]] = _render_pdf_pages_fallback(
+            tmp_path,
+            dpi=OCR_RENDER_DPI,
+            max_pages=OCR_RENDER_MAX_PAGES,
+            log=log,
+        )
+        if not pages_for_ocr:
+            pages_for_ocr = list(aggregated_page_images)
+        if not pages_for_ocr:
+            log.warning("Doc parser: OCR-only path failed to obtain page images")
+            markdown = ""
+            metadata["page_images_available"] = 0
+        else:
+            metadata["page_images_available"] = len(pages_for_ocr)
+            ocr_markdown, ocr_meta = _ocr_document_pages(pages_for_ocr, job_key, filename)
+            markdown = clean_markdown(ocr_markdown)
+            metadata.update(ocr_meta)
+        page_count = metadata.get("page_count") or (
+            len(pages_for_ocr) if pages_for_ocr else metadata.get("page_count")
+        )
+        if isinstance(page_count, int):
+            metadata["page_count"] = page_count
+        metadata["images_count"] = 0
+        pages_processed_value = page_count if isinstance(page_count, int) else None
+        char_count, line_count = _calc_text_density(markdown)
+        metadata["text_char_count"] = char_count
+        metadata["text_non_empty_lines"] = line_count
+        if cache_tracker:
+            cache_tracker.update_phase(
+                "ocr",
+                pages_processed=pages_processed_value,
+                pages_total=pages_processed_value,
+                figures_described=0,
+                figures_total=0,
+                batch_index=total_batches,
+                batches_total=total_batches,
             )
-    else:
-        pending_figs = list(valid_figs)
+            cache_tracker.finalize(markdown, metadata)
+        log.info("Doc parser: composed final markdown via OCR-only pipeline")
+        return markdown, metadata
+    valid_figs_all = [f for f in aggregated_figures if len(f.jpeg_bytes) >= 5000]
+    metadata["images_count"] = len(valid_figs_all)
+    metadata["page_images_available"] = len(aggregated_page_images)
+    log.info(
+        f"Doc parser: retained {len(valid_figs_all)} valid figures (>=5KB) from {len(aggregated_figures)} total"
+    )
+    descs = sorted(aggregated_descs.values(), key=lambda d: d.index)
+    markdown = compose_markdown(aggregated_base_md, descs)
+    markdown = clean_markdown(markdown)
     if cache_tracker:
         pages_total_val = metadata.get("page_count")
         pages_total_int = pages_total_val if isinstance(pages_total_val, int) else None
@@ -575,25 +771,12 @@ def _parse_pdf(
             "figures",
             pages_processed=pages_total_int,
             pages_total=pages_total_int,
-            figures_described=described_from_cache,
-            figures_total=len(valid_figs),
+            figures_described=len([d for d in descs if d.description]),
+            figures_total=len(valid_figs_all),
+            batch_index=total_batches if isinstance(total_batches, int) else None,
+            batches_total=total_batches,
         )
-    descs = list(cached_descs)
-    if pending_figs:
-        descs.extend(
-            _describe_figures(
-                pending_figs, prompt, job_key, filename, cache_tracker=cache_tracker
-            )
-        )
-    descs.sort(key=lambda d: d.index)
-    desc_seconds = time.perf_counter() - t_desc
-    if valid_figs:
-        log.info(
-            f"Doc parser: completed figure descriptions in {desc_seconds:.2f}s (described={len(descs)})"
-        )
-    markdown = compose_markdown(base_md, descs)
-    markdown = clean_markdown(markdown)
-    page_count = metadata.get("page_count") or (len(page_images) if page_images else None)
+    page_count = metadata.get("page_count") or (len(aggregated_page_images) if aggregated_page_images else None)
     if page_count and metadata.get("page_count") is None:
         metadata["page_count"] = page_count
     char_count, line_count = _calc_text_density(markdown)
@@ -614,9 +797,11 @@ def _parse_pdf(
                 pages_processed=pages_total,
                 pages_total=pages_total,
                 figures_described=len(descs),
-                figures_total=len(valid_figs),
+                figures_total=len(valid_figs_all),
+                batch_index=total_batches if isinstance(total_batches, int) else None,
+                batches_total=total_batches,
             )
-        pages_for_ocr: List[Tuple[int, bytes]] = list(page_images)
+        pages_for_ocr: List[Tuple[int, bytes]] = list(aggregated_page_images)
         if not pages_for_ocr:
             fallback_images = _render_pdf_pages_fallback(
                 tmp_path,
@@ -648,7 +833,9 @@ def _parse_pdf(
             pages_processed=pages_total,
             pages_total=pages_total,
             figures_described=len(descs),
-            figures_total=len(valid_figs),
+            figures_total=len(valid_figs_all),
+            batch_index=total_batches if isinstance(total_batches, int) else None,
+            batches_total=total_batches,
         )
     log.info("Doc parser: composed final markdown")
     log.info(
@@ -702,7 +889,8 @@ def parse_document(
     else:
         if image_bytes is None:
             # In synchronous code we assume the caller has already read the file
-            data = open(tmp_path, "rb").read()
+            with open(tmp_path, "rb") as f:
+                data = f.read()
         else:
             data = image_bytes
         return _parse_image(data, filename, ext, job_key)
@@ -713,6 +901,10 @@ __all__ = [
     "extract_metadata_from_doc",
     "clean_markdown",
 ]
+
+
+
+
 
 
 

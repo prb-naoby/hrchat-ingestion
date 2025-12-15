@@ -1,8 +1,13 @@
 .venv/
 .cache_fastembed/
 __pycache__/
-*.pyc
+*.py[cod]
 .git/
 .gitignore
 .env
+.env.*
 temp/
+logs/
+ingest_queue/
+*.log
+*.code-workspace

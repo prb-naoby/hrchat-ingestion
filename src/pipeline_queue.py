@@ -1,4 +1,4 @@
-﻿"""Queued ingestion worker.
+"""Queued ingestion worker.
 
 This module scans `INGEST_QUEUE_DIR` for enqueued documents (written by the
 FastAPI layer), optionally retries unfinished jobs from `temp/`, and runs the
@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 from datetime import datetime, timedelta
 
-from .pipeline_sync import process_file
+from .pipeline import process_file
 from .qdrant_utils import qdrant_client
 from .logger import get_logger
 
@@ -30,7 +30,7 @@ warnings.filterwarnings(
 
 QUEUE_DIR = Path(os.getenv("INGEST_QUEUE_DIR", "ingest_queue"))
 TEMP_DIR = Path(os.getenv("INGEST_TEMP_DIR", "temp"))
-WORKER_CONCURRENCY = max(1, int(os.getenv("INGEST_WORKER_CONCURRENCY", "2")))
+WORKER_CONCURRENCY = max(1, int(os.getenv("INGEST_WORKER_CONCURRENCY", "1")))
 LOCK_TTL_SECONDS = float(os.getenv("INGEST_LOCK_TTL_SEC", "300"))
 MAX_RETRIES = max(1, int(os.getenv("INGEST_MAX_RETRIES", "3")))
 FAILED_COOLDOWN_DAYS = int(os.getenv("INGEST_FAILED_COOLDOWN_DAYS", "7"))
@@ -291,10 +291,33 @@ def _process_job(pdf_processing_path: Path, meta_path: Path) -> int:
         heartbeat_ts = progress_copy.get("heartbeat_ts")
         if isinstance(heartbeat_ts, str):
             metadata["parse_progress_ts"] = heartbeat_ts
+        phase = progress_copy.get("phase")
+        pages_processed = progress_copy.get("pages_processed")
+        pages_total = progress_copy.get("pages_total")
+        figures_described = progress_copy.get("figures_described")
+        figures_total = progress_copy.get("figures_total")
+        batch_index = progress_copy.get("batch_index")
+        batches_total = progress_copy.get("batches_total")
+        pct = None
+        if isinstance(pages_processed, (int, float)) and isinstance(pages_total, (int, float)) and pages_total:
+            pct = round(float(pages_processed) / float(pages_total) * 100, 2)
         try:
             _write_metadata(meta_path, metadata)
         except Exception:
             pass
+        parts = [f"phase={phase}"] if phase else ["phase=unknown"]
+        if isinstance(pages_processed, (int, float)):
+            total_str = str(pages_total) if isinstance(pages_total, (int, float)) else "?"
+            parts.append(f"pages={pages_processed}/{total_str}")
+        if isinstance(figures_described, (int, float)):
+            fig_total = str(figures_total) if isinstance(figures_total, (int, float)) else "?"
+            parts.append(f"figures={figures_described}/{fig_total}")
+        if isinstance(batch_index, (int, float)):
+            batch_total = str(batches_total) if isinstance(batches_total, (int, float)) else "?"
+            parts.append(f"batch={batch_index}/{batch_total}")
+        if pct is not None:
+            parts.append(f"progress={pct:.2f}%")
+        log.info("Queue progress: " + " ".join(parts))
 
     progress_entry = metadata.get("parse_progress")
     if isinstance(progress_entry, dict):
@@ -346,12 +369,6 @@ def _process_job(pdf_processing_path: Path, meta_path: Path) -> int:
             reason = f"uploaded_chunks={uploaded}"
             return _requeue_or_drop(queue_pdf, pdf_processing_path, meta_path, metadata, attempts, reason, log)
         _remove_failed_entry(job_key, filename)
-        cache_path_str = metadata.get("cache_path")
-        if cache_path_str:
-            try:
-                Path(cache_path_str).unlink(missing_ok=True)
-            except Exception:
-                pass
         log.info(f"Ingestion completed: uploaded_chunks={uploaded}")
         pdf_processing_path.unlink(missing_ok=True)
         meta_path.unlink(missing_ok=True)
@@ -459,7 +476,86 @@ def get_failed_jobs() -> list[dict[str, Any]]:
     return jobs
 
 
-__all__ = ["run_once", "run_forever", "get_failed_jobs"]
+def get_queue_status() -> list[dict[str, Any]]:
+    jobs: list[dict[str, Any]] = []
+    meta_paths = sorted(QUEUE_DIR.glob("*.pdf.json"))
+    for meta_path in meta_paths:
+        try:
+            metadata = _load_metadata(meta_path)
+        except Exception:
+            continue
+        queue_pdf = Path(meta_path.with_suffix(""))
+        processing_path = queue_pdf.with_suffix(queue_pdf.suffix + ".processing")
+        if processing_path.exists():
+            status = "processing"
+            stat_path = processing_path
+        elif queue_pdf.exists():
+            status = "queued"
+            stat_path = queue_pdf
+        else:
+            status = "pending"
+            stat_path = meta_path
+        parse_progress = metadata.get("parse_progress")
+        if not isinstance(parse_progress, dict):
+            parse_progress = {}
+        heartbeat_ts = parse_progress.get("heartbeat_ts")
+        heartbeat_age = None
+        if isinstance(heartbeat_ts, str):
+            try:
+                hb_dt = datetime.fromisoformat(heartbeat_ts.replace("Z", "+00:00"))
+                heartbeat_age = (datetime.utcnow() - hb_dt).total_seconds()
+            except Exception:
+                heartbeat_age = None
+        pages_processed = parse_progress.get("pages_processed")
+        pages_total = parse_progress.get("pages_total")
+        progress_pct: Optional[float] = None
+        if isinstance(pages_processed, (int, float)) and isinstance(pages_total, (int, float)) and pages_total:
+            progress_pct = round(float(pages_processed) / float(pages_total) * 100.0, 2)
+        job_key = metadata.get("job_key") or queue_pdf.stem.replace(".pdf", "")
+        job_entry: Dict[str, Any] = {
+            "job_key": job_key,
+            "filename": metadata.get("filename"),
+            "category": metadata.get("category"),
+            "status": status,
+            "file_size_bytes": metadata.get("file_size_bytes"),
+            "attempts": metadata.get("attempts", 0),
+            "parse_progress": parse_progress,
+            "progress_percent": progress_pct,
+            "heartbeat_age_seconds": heartbeat_age,
+            "metadata_path": str(meta_path),
+            "queued_file": str(queue_pdf) if queue_pdf.exists() else None,
+            "parse_progress_ts": heartbeat_ts if isinstance(heartbeat_ts, str) else None,
+            "cache_path": metadata.get("cache_path"),
+            "cache_created_ts": metadata.get("cache_created_ts"),
+        }
+        batch_index = parse_progress.get("batch_index")
+        batches_total = parse_progress.get("batches_total")
+        if isinstance(batch_index, (int, float)):
+            job_entry["batch_index"] = batch_index
+        if isinstance(batches_total, (int, float)):
+            job_entry["batches_total"] = batches_total
+        try:
+            stat_mtime = stat_path.stat().st_mtime
+            job_entry["updated_ts"] = datetime.utcfromtimestamp(stat_mtime).isoformat(timespec="seconds") + "Z"
+        except Exception:
+            job_entry["updated_ts"] = None
+        jobs.append(job_entry)
+    jobs.sort(
+        key=lambda j: (
+            0 if j.get("status") == "processing" else 1,
+            j.get("parse_progress_ts") or "",
+            j.get("filename") or "",
+        )
+    )
+    return jobs
+
+
+__all__ = ["run_once", "run_forever", "get_failed_jobs", "get_queue_status"]
+
+
+
+
+
 
 
 

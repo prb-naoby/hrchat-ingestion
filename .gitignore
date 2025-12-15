@@ -1,7 +1,11 @@
-.venv
+.venv/
 .env
-temp
-src/__pycache__
-*.pyc
+.env.*
+temp/
+logs/
+ingest_queue/
+.cache_fastembed/
+__pycache__/
+*.py[cod]
+*.log
 *.code-workspace
-*.cache_fastembed/

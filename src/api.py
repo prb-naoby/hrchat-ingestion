@@ -43,7 +43,7 @@ warnings.filterwarnings(
     module="torch.utils.data.dataloader",
 )
 
-from .pipeline_sync import process_file
+from .pipeline import process_file
 from .qdrant_utils import qdrant_client, delete_points_by_filename
 from .logger import get_logger
 from .bm25_endpoint import attach_bm25_endpoints
@@ -54,7 +54,7 @@ from .sync_utils import (
     drive_items_from_payload,
     group_items_by_category,
 )
-from .pipeline_queue import run_once as run_queue_once, get_failed_jobs
+from .pipeline_queue import run_once as run_queue_once, get_failed_jobs, get_queue_status
 
 
 app = FastAPI(title="Document Ingestion API (default async)")
@@ -109,8 +109,9 @@ def _idempotent_create_indexes(client, collection: str, fields: Iterable[str]) -
                 field_schema="keyword",
                 wait=True,
             )
-        except Exception:
-            # ignore "already exists" or transient errors
+        except Exception as e:
+            # ignore "already exists" or transient errors, but log them for debugging
+            # get_logger(job="system", file="api", phase="init").debug(f"Index creation note: {e}")
             pass
 
 
@@ -183,6 +184,18 @@ def _format_category_diff(diff: CategoryDiff) -> Dict[str, Any]:
 @app.get("/queue/failed")
 def list_failed_jobs_endpoint() -> JSONResponse:
     jobs = get_failed_jobs()
+    return JSONResponse(
+        {
+            "count": len(jobs),
+            "jobs": jobs,
+        },
+        status_code=200,
+    )
+
+
+@app.get("/queue/status")
+def list_queue_status_endpoint() -> JSONResponse:
+    jobs = get_queue_status()
     return JSONResponse(
         {
             "count": len(jobs),
