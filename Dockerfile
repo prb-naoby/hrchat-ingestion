@@ -2,17 +2,17 @@
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+  PIP_NO_CACHE_DIR=1
 
 # System deps untuk Docling/Pillow/Tesseract
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      build-essential \
-      poppler-utils \
-      tesseract-ocr \
-      libjpeg-dev zlib1g-dev libpng-dev libstdc++6 \
-      curl ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+  apt-get install -y --no-install-recommends \
+  build-essential \
+  poppler-utils \
+  tesseract-ocr \
+  libjpeg-dev zlib1g-dev libpng-dev libstdc++6 \
+  curl ca-certificates && \
+  rm -rf /var/lib/apt/lists/*
 
 # Buat user non-root
 RUN useradd -m -u 10001 appuser

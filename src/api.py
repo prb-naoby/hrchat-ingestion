@@ -46,8 +46,6 @@ warnings.filterwarnings(
 from .pipeline import process_file
 from .qdrant_utils import qdrant_client, delete_points_by_filename
 from .logger import get_logger
-from .bm25_endpoint import attach_bm25_endpoints
-from .retrieve import attach_retrieval_endpoints
 from .sync_utils import (
     CategoryDiff,
     compute_category_diffs,
@@ -57,9 +55,7 @@ from .sync_utils import (
 from .pipeline_queue import run_once as run_queue_once, get_failed_jobs, get_queue_status
 
 
-app = FastAPI(title="Document Ingestion API (default async)")
-attach_bm25_endpoints(app)
-attach_retrieval_endpoints(app)
+app = FastAPI(title="Document Ingestion API")
 QUEUE_DIR = Path(os.getenv("INGEST_QUEUE_DIR", "ingest_queue"))
 
 # ---------------------------
